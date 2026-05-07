@@ -944,6 +944,25 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
             }
         }
     }
+
+    memset(&out->nlq, 0, sizeof(out->nlq));
+
+    out->nlq.residual_enabled = !header->disable_residual_flag &&
+                                mapping->nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ;
+    out->nlq.el_spatial_resampling_filter =
+        header->el_spatial_resampling_filter_flag;
+    out->nlq.el_bit_depth = header->el_bit_depth;
+    for (int c = 0; c < 3; c++) {
+        const AVDOVINLQParams *nlq = &mapping->nlq[c];
+        const float el_scale = 1.0f / ((1 << header->el_bit_depth) - 1);
+        const float coef_scale = 1.0f / (1 << header->coef_log2_denom);
+        out->nlq.offset[c] = el_scale * nlq->nlq_offset;
+        out->nlq.vdr_in_max[c] = coef_scale * nlq->vdr_in_max;
+        out->nlq.linear_deadzone_slope[c] =
+            coef_scale * nlq->linear_deadzone_slope;
+        out->nlq.linear_deadzone_threshold[c] =
+            coef_scale * nlq->linear_deadzone_threshold;
+    }
 }
 
 static bool pl_avdovi_nlq_is_trivial(const AVDOVIRpuDataHeader *header,
@@ -966,18 +985,18 @@ static bool pl_avdovi_mapping_nlq_is_trivial(const AVDOVIRpuDataHeader *header,
 
 PL_LIBAV_API bool pl_avdovi_metadata_supported(const AVDOVIMetadata *metadata)
 {
-    const AVDOVIRpuDataHeader *header;
-    const AVDOVIDataMapping *mapping;
+    if (!metadata)
+        return false;
 
-    header = av_dovi_get_header(metadata);
+    const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+    if (!header)
+        return false;
+
     if (header->disable_residual_flag)
         return true;
 
-    mapping = av_dovi_get_mapping(metadata);
-    if (pl_avdovi_mapping_nlq_is_trivial(header, mapping))
-        return true;
-
-    return false;
+    const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
+    return mapping && pl_avdovi_mapping_nlq_is_trivial(header, mapping);
 }
 
 PL_LIBAV_API void pl_map_avdovi_metadata(struct pl_color_space *color,
@@ -1069,6 +1088,9 @@ struct pl_avframe_priv {
     AVFrame *avframe;
     struct pl_dovi_metadata dovi; // backing storage for per-frame dovi metadata
     pl_tex planar; // for planar vulkan textures
+
+    struct pl_frame dovi_el_frame;
+    bool dovi_el_mapped;
 };
 
 #define COMP_MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -1354,6 +1376,27 @@ static void pl_unmap_avframe_vulkan(pl_gpu gpu, struct pl_frame *frame)
 }
 #endif
 
+// Map the paired EL AVFrame privately and expose it as a nested pl_frame.
+static bool pl_map_avframe_dovi_el(pl_gpu gpu, struct pl_frame *out,
+                                    struct pl_avframe_priv *priv,
+                                    const struct pl_avframe_params *params)
+{
+    if (!params->dovi_el_frame)
+        return true;
+
+    struct pl_avframe_params el_params = {
+        .frame = params->dovi_el_frame,
+        .tex = params->dovi_el_tex,
+    };
+
+    if (!pl_map_avframe_ex(gpu, &priv->dovi_el_frame, &el_params))
+        return false;
+
+    priv->dovi_el_mapped = true;
+    out->enhancement_layer = &priv->dovi_el_frame;
+    return true;
+}
+
 PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
                                     const struct pl_avframe_params *params)
 {
@@ -1363,7 +1406,7 @@ PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
     pl_tex *tex = params->tex;
     int planes;
 
-    struct pl_avframe_priv *priv = malloc(sizeof(*priv));
+    struct pl_avframe_priv *priv = calloc(1, sizeof(*priv));
     if (!priv)
         goto error;
 
@@ -1372,12 +1415,15 @@ PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
     out->user_data = priv;
 
 #ifdef PL_HAVE_LAV_DOLBY_VISION
-    if (params->map_dovi) {
+    bool map_dovi = params->map_dovi || params->dovi_el_frame;
+    bool force_dovi = params->map_dovi_force || params->dovi_el_frame;
+    if (map_dovi) {
         AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
         if (sd) {
             const AVDOVIMetadata *metadata = (AVDOVIMetadata *) sd->data;
-            // Only automatically map DoVi RPUs that don't require a (full) EL
-            if (params->map_dovi_force || pl_avdovi_metadata_supported(metadata))
+            // Only automatically map DoVi RPUs that don't require EL residual
+            // reconstruction, unless a paired EL frame was provided.
+            if (force_dovi || pl_avdovi_metadata_supported(metadata))
                 pl_map_avdovi_metadata(&out->color, &out->repr, &priv->dovi, metadata);
         }
 
@@ -1394,16 +1440,22 @@ PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
     case AV_PIX_FMT_DRM_PRIME:
         if (!pl_map_avframe_drm(gpu, out, frame))
             goto error;
+        if (!pl_map_avframe_dovi_el(gpu, out, priv, params))
+            goto error;
         return true;
 
     case AV_PIX_FMT_VAAPI:
         if (!pl_map_avframe_derived(gpu, out, frame))
+            goto error;
+        if (!pl_map_avframe_dovi_el(gpu, out, priv, params))
             goto error;
         return true;
 
 #ifdef PL_HAVE_LAV_VULKAN
     case AV_PIX_FMT_VULKAN:
         if (!pl_map_avframe_vulkan(gpu, out, frame))
+            goto error;
+        if (!pl_map_avframe_dovi_el(gpu, out, priv, params))
             goto error;
         return true;
 #endif
@@ -1454,6 +1506,8 @@ PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
         out->planes[p].texture = tex[p];
     }
 
+    if (!pl_map_avframe_dovi_el(gpu, out, priv, params))
+        goto error;
     return true;
 
 error:
@@ -1477,6 +1531,9 @@ PL_LIBAV_API void pl_unmap_avframe(pl_gpu gpu, struct pl_frame *frame)
     const AVPixFmtDescriptor *desc;
     if (!priv)
         goto done;
+
+    if (priv->dovi_el_mapped)
+        pl_unmap_avframe(gpu, &priv->dovi_el_frame);
 
 #ifdef PL_HAVE_LAV_VULKAN
     if (priv->avframe->format == AV_PIX_FMT_VULKAN)

@@ -135,8 +135,6 @@ PL_DEPRECATED_IN(v7.343) PL_LIBAV_API void pl_frame_map_avdovi_metadata(
 // This function will always attempt to map the metadata, even if this mapping
 // would be incomplete due to unsupported features. The caller is advised
 // to use pl_dovi_metadata_supported() to check whether this is the case.
-// Currently, the mapping will only be complete if FEL (full enhancement layer)
-// is not used.
 PL_LIBAV_API void pl_map_avdovi_metadata(struct pl_color_space *color,
                                          struct pl_color_repr *repr,
                                          struct pl_dovi_metadata *dovi,
@@ -188,6 +186,12 @@ struct pl_avframe_params {
     // Ignore the checks and always map Dolby Vision metadata (even if this
     // mapping will be incomplete). Does not imply ->map_dovi.
     bool map_dovi_force;
+
+    // Dolby Vision enhancement layer AVFrame
+    const AVFrame *dovi_el_frame;
+    
+    // Backing textures for Dolby Vision EL frame
+    pl_tex *dovi_el_tex;
 };
 
 #define PL_AVFRAME_DEFAULTS \

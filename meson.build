@@ -12,6 +12,8 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     {
+      '366': 'add pl_frame.enhancement_layer',
+      '365': 'reserved',
       '364': 'add pl_avdovi_metadata_supported, lift checks out of pl_map_avdovi_metadata, extend pl_avframe_params',
       '363': 'add pl_frame.pixel_aspect_ratio',
       '362': 'add PL_COLOR_TRC_SCRGB',

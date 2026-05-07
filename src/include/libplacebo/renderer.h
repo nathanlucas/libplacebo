@@ -542,6 +542,9 @@ struct pl_frame {
     enum pl_field first_field;
     const struct pl_frame *prev, *next;
 
+    // Optional decoded enhancement-layer
+    const struct pl_frame *enhancement_layer;
+
     // If set, will be called immediately before GPU access to this frame. This
     // function *may* be used to, for example, perform synchronization with
     // external APIs (e.g. `pl_vulkan_hold/release`). If your mapping requires

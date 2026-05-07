@@ -286,10 +286,16 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
     {
         ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
         GLSL("color.rgb *= vec3("$"); \n", scale);
-    }
 
-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
         pl_shader_dovi_reshape(sh, repr->dovi);
+        if (repr->dovi && repr->dovi->nlq.residual_enabled) {
+            GLSL("#ifdef PL_DOVI_EL_RESIDUAL_DEFINED                         \n"
+                 "color = vec4(clamp(color.rgb + dovi_el_residual, 0.0, 1.0),\n"
+                 "             color.a);                                     \n"
+                 "#endif                                                     \n"
+            );
+        }
+    }
 
     enum pl_color_system orig_sys = repr->sys;
     pl_transform3x3 tr = pl_color_repr_decode(repr, params);

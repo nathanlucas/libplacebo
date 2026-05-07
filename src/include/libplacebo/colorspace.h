@@ -146,6 +146,18 @@ struct pl_dovi_metadata {
         float mmr_constant[8];
         float mmr_coeffs[8][3 /* order */][7];
     } comp[3];
+
+    // EL residual reconstruction metadata
+    struct pl_dovi_nlq_data {
+        //uint8_t method;
+        bool residual_enabled;
+        bool el_spatial_resampling_filter;
+        uint8_t el_bit_depth;
+        float offset[3];
+        float vdr_in_max[3];
+        float linear_deadzone_slope[3];
+        float linear_deadzone_threshold[3];
+    } nlq;
 };
 
 // Struct describing the underlying color system and representation. This

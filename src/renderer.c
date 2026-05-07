@@ -365,6 +365,9 @@ struct pass_state {
     // Cached copies of the `prev` / `next` frames, for deinterlacing.
     struct pl_frame prev, next;
 
+    // Cached copy of the image enhancement layer, if any.
+    struct pl_frame dovi_el;
+
     // Some extra plane metadata, inferred from `planes`
     enum plane_type src_type[4];
     int src_ref, dst_ref; // index into `planes`
@@ -376,7 +379,7 @@ struct pass_state {
 
     // Map of acquired frames
     struct {
-        bool target, image, prev, next;
+        bool target, image, prev, next, dovi_el;
     } acquired;
 };
 
@@ -1269,6 +1272,8 @@ static const char *plane_type_names[] = {
     [PLANE_XYZ]     = "xyz",
 };
 
+static int frame_ref(const struct pl_frame *frame);
+
 static void log_plane_info(pl_renderer rr, const struct plane_state *st)
 {
     const struct pl_plane *plane = &st->plane;
@@ -1309,6 +1314,669 @@ static void log_plane_info(pl_renderer rr, const struct plane_state *st)
              st->img.repr.bits.color_depth,
              st->img.repr.bits.sample_depth,
              st->img.repr.bits.bit_shift);
+}
+
+static void init_frame_plane_states(const struct pl_frame *frame,
+                                    struct plane_state planes[4])
+{
+    for (int i = 0; i < frame->num_planes; i++) {
+        planes[i] = (struct plane_state) {
+            .type = detect_plane_type(&frame->planes[i], &frame->repr),
+            .plane = frame->planes[i],
+            .img = {
+                .w = frame->planes[i].texture->params.w,
+                .h = frame->planes[i].texture->params.h,
+                .tex = frame->planes[i].texture,
+                .repr = frame->repr,
+                .color = frame->color,
+                .comps = frame->planes[i].components,
+            },
+            .fmt = frame->planes[i].texture->params.format,
+        };
+
+        // Explicitly skip alpha channel when overridden
+        if (frame->repr.alpha != PL_ALPHA_NONE)
+            continue;
+
+        if (planes[i].type == PLANE_ALPHA) {
+            planes[i].type = PLANE_INVALID;
+            continue;
+        }
+
+        for (int j = 0; j < planes[i].plane.components; j++) {
+            if (planes[i].plane.component_mapping[j] == PL_CHANNEL_A)
+                planes[i].plane.component_mapping[j] = PL_CHANNEL_NONE;
+        }
+    }
+}
+
+static void set_plane_state_rect_for_crop(pl_rect2df crop, pl_tex ref_tex,
+                                          struct plane_state *st,
+                                          bool apply_flipped)
+{
+    float rx = (float) st->plane.texture->params.w / ref_tex->params.w,
+          ry = (float) st->plane.texture->params.h / ref_tex->params.h;
+
+    // Only accept integer scaling ratios. This accounts for the fact that
+    // fractionally subsampled planes get rounded up to the nearest integer
+    // size, which we want to discard.
+    float rrx = rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx),
+          rry = ry >= 1 ? roundf(ry) : 1.0 / roundf(1.0 / ry);
+
+    float sx = st->plane.shift_x,
+          sy = st->plane.shift_y;
+
+    st->img.rect = (pl_rect2df) {
+        .x0 = (crop.x0 - sx) * rrx,
+        .y0 = (crop.y0 - sy) * rry,
+        .x1 = (crop.x1 - sx) * rrx,
+        .y1 = (crop.y1 - sy) * rry,
+    };
+
+    st->plane_w = ref_tex->params.w * rrx;
+    st->plane_h = ref_tex->params.h * rry;
+
+    if (apply_flipped && st->plane.flipped) {
+        st->img.rect.y0 = st->plane_h - st->img.rect.y0;
+        st->img.rect.y1 = st->plane_h - st->img.rect.y1;
+    }
+}
+
+static void set_plane_state_rect(const struct pl_frame *frame, pl_tex ref_tex,
+                                 struct plane_state *st)
+{
+    set_plane_state_rect_for_crop(frame->crop, ref_tex, st, false);
+}
+
+struct dovi_el_component {
+    struct plane_state *state;
+    int sample_order;
+};
+
+static float dovi_el_rect_y0(const struct plane_state *st)
+{
+    return st->plane.flipped ? st->plane_h - st->img.rect.y0 : st->img.rect.y0;
+}
+
+static bool dovi_el_find_component(struct plane_state planes[4],
+                                    int num_planes,
+                                    enum pl_channel channel,
+                                    struct dovi_el_component *out)
+{
+    for (int p = 0; p < num_planes; p++) {
+        struct plane_state *st = &planes[p];
+        const struct pl_plane *plane = &st->plane;
+        if (!st->type || !plane->texture || !st->fmt)
+            continue;
+
+        for (int c = 0; c < plane->components; c++) {
+            if (plane->component_mapping[c] != channel)
+                continue;
+
+            *out = (struct dovi_el_component) {
+                .state = st,
+                .sample_order = st->fmt->sample_order[c],
+            };
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static enum plane_type dovi_el_plane_type(const struct pl_plane *plane)
+{
+    enum plane_type type = PLANE_INVALID;
+
+    for (int c = 0; c < plane->components; c++) {
+        switch (plane->component_mapping[c]) {
+        case PL_CHANNEL_Y:  type = PL_MAX(type, PLANE_LUMA); break;
+        case PL_CHANNEL_CB:
+        case PL_CHANNEL_CR: type = PL_MAX(type, PLANE_CHROMA); break;
+        case PL_CHANNEL_A:  type = PL_MAX(type, PLANE_ALPHA); break;
+        default: break;
+        }
+    }
+
+    return type;
+}
+
+static bool dovi_el_validate_frame(const struct pl_frame *image)
+{
+    if (!image || image->num_planes <= 0 ||
+        image->num_planes > PL_MAX_PLANES)
+        return false;
+
+    for (int p = 0; p < image->num_planes; p++) {
+        const struct pl_plane *plane = &image->planes[p];
+        if (!plane->texture || !plane->texture->params.sampleable)
+            return false;
+        if (pl_tex_params_dimension(plane->texture->params) != 2)
+            return false;
+
+        if (plane->components <= 0 || plane->components > 4)
+            return false;
+
+        for (int c = 0; c < plane->components; c++) {
+            if (plane->component_mapping[c] < PL_CHANNEL_NONE ||
+                plane->component_mapping[c] > PL_CHANNEL_A)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static struct pl_bit_encoding dovi_el_infer_bits(const struct pl_frame *image)
+{
+    struct pl_bit_encoding bits = image->repr.bits;
+    if (bits.sample_depth || image->num_planes <= 0)
+        return bits;
+
+    int ref = 0;
+    for (int i = 0; i < image->num_planes; i++) {
+        if (dovi_el_plane_type(&image->planes[i]) == PLANE_LUMA) {
+            ref = i;
+            break;
+        }
+    }
+
+    pl_tex tex = image->planes[ref].texture;
+    pl_fmt fmt = tex ? tex->params.format : NULL;
+    if (!fmt || fmt->type != PL_FMT_UNORM)
+        return bits;
+
+    bits.sample_depth = fmt->component_depth[0];
+    bits.color_depth = PL_DEF(bits.color_depth, bits.sample_depth);
+    bits.color_depth = PL_MIN(bits.color_depth, bits.sample_depth);
+    bits.bit_shift += bits.sample_depth - bits.color_depth;
+    return bits;
+}
+
+static void init_dovi_el_plane_states(const struct pl_frame *image,
+                                      struct plane_state planes[4])
+{
+    struct pl_color_repr repr = {
+        .sys = PL_COLOR_SYSTEM_BT_2020_NC,
+        .levels = PL_COLOR_LEVELS_FULL,
+        .alpha = PL_ALPHA_NONE,
+        .bits = dovi_el_infer_bits(image),
+    };
+
+    for (int i = 0; i < image->num_planes; i++) {
+        planes[i] = (struct plane_state) {
+            .type = dovi_el_plane_type(&image->planes[i]),
+            .plane = image->planes[i],
+            .img = {
+                .w = image->planes[i].texture->params.w,
+                .h = image->planes[i].texture->params.h,
+                .tex = image->planes[i].texture,
+                .repr = repr,
+                .comps = image->planes[i].components,
+            },
+            .fmt = image->planes[i].texture->params.format,
+        };
+    }
+}
+
+static bool pl_shader_dovi_prepare_el_residual(pl_shader sh,
+                                                const struct pl_frame *image,
+                                                const struct pl_dovi_metadata *data,
+                                                float target_width,
+                                                float target_height)
+{
+#ifdef PL_HAVE_DOVI
+    const struct pl_frame *el = image ? image->enhancement_layer : NULL;
+    if (!image || !data || !data->nlq.residual_enabled ||
+        !el || !el->num_planes)
+        return false;
+
+    if (!dovi_el_validate_frame(el))
+        return false;
+
+    struct plane_state el_planes[4] = {0};
+    init_dovi_el_plane_states(el, el_planes);
+
+    struct dovi_el_component el_y = {0}, el_cb = {0}, el_cr = {0};
+    if (!dovi_el_find_component(el_planes, el->num_planes, PL_CHANNEL_Y, &el_y) ||
+        !dovi_el_find_component(el_planes, el->num_planes, PL_CHANNEL_U, &el_cb) ||
+        !dovi_el_find_component(el_planes, el->num_planes, PL_CHANNEL_V, &el_cr))
+        return false;
+
+    if (el_y.sample_order < 0 || el_y.sample_order >= 4 ||
+        el_cb.sample_order < 0 || el_cb.sample_order >= 4 ||
+        el_cr.sample_order < 0 || el_cr.sample_order >= 4)
+        return false;
+
+    pl_tex image_ref = image->planes[frame_ref(image)].texture;
+    pl_tex el_ref = el_y.state->plane.texture;
+    if (!image_ref || !el_ref)
+        return false;
+
+    float scale_x = (float) el_ref->params.w / (float) image_ref->params.w;
+    float scale_y = (float) el_ref->params.h / (float) image_ref->params.h;
+    if (!isfinite(scale_x) || !isfinite(scale_y))
+        return false;
+
+    pl_rect2df el_crop = {
+        .x0 = image->crop.x0 * scale_x,
+        .y0 = image->crop.y0 * scale_y,
+        .x1 = image->crop.x1 * scale_x,
+        .y1 = image->crop.y1 * scale_y,
+    };
+
+    set_plane_state_rect_for_crop(el_crop, el_ref, el_y.state, true);
+    set_plane_state_rect_for_crop(el_crop, el_ref, el_cb.state, true);
+    set_plane_state_rect_for_crop(el_crop, el_ref, el_cr.state, true);
+
+    bool packed_chroma = el_cb.state->plane.texture == el_cr.state->plane.texture;
+    int target_w = lroundf(target_width);
+    int target_h = lroundf(target_height);
+    int el_y_w = lroundf(fabsf(pl_rect_w(el_y.state->img.rect)));
+    int el_y_h = lroundf(fabsf(pl_rect_h(el_y.state->img.rect)));
+    int el_c_w = lroundf(fabsf(pl_rect_w(el_cb.state->img.rect)));
+    int el_c_h = lroundf(fabsf(pl_rect_h(el_cb.state->img.rect)));
+    bool el_is_420 = abs(el_c_w * 2 - el_y_w) <= 1 &&
+                     abs(el_c_h * 2 - el_y_h) <= 1;
+    bool el_size_matches_filter = data->nlq.el_spatial_resampling_filter
+        ? abs(el_y_w * 2 - target_w) <= 1 &&
+          abs(el_y_h * 2 - target_h) <= 1
+        : abs(el_y_w - target_w) <= 1 &&
+          abs(el_y_h - target_h) <= 1;
+
+    if (!el_is_420 || !el_size_matches_filter) {
+        PL_DEBUG(sh, "Skipping Dolby Vision EL residual: unsupported geometry "
+                 "(el_spatial_resampling_filter=%d, target=%dx%d, "
+                 "EL luma=%dx%d, EL chroma=%dx%d, el_is_420=%d, "
+                 "el_size_matches_filter=%d)",
+                 data->nlq.el_spatial_resampling_filter, target_w, target_h, el_y_w,
+                 el_y_h, el_c_w, el_c_h, el_is_420, el_size_matches_filter);
+        return false;
+    }
+
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, target_w, target_h))
+        return false;
+
+    float el_max = fmaxf(exp2f(data->nlq.el_bit_depth) - 1.0f, 1.0f);
+
+    ident_t nlq_offset = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec3("dovi_el_nlq_offset"),
+        .data = data->nlq.offset,
+        .dynamic = true,
+    });
+
+    ident_t nlq_slope = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec3("dovi_el_nlq_linear_slope"),
+        .data = data->nlq.linear_deadzone_slope,
+        .dynamic = true,
+    });
+
+    ident_t nlq_threshold = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec3("dovi_el_nlq_linear_threshold"),
+        .data = data->nlq.linear_deadzone_threshold,
+        .dynamic = true,
+    });
+
+    ident_t nlq_vdr_in_max = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec3("dovi_el_nlq_vdr_in_max"),
+        .data = data->nlq.vdr_in_max,
+        .dynamic = true,
+    });
+
+    ident_t nlq_el_max = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_float("dovi_el_nlq_el_max"),
+        .data = &el_max,
+        .dynamic = true,
+    });
+
+    ident_t inv_nlq = sh_fresh(sh, "dovi_el_inverse_nlq_sample");
+    GLSLH("float "$"(float el, float offset, float slope, float threshold, \n"
+          "          float vdr_in_max, float el_max)                       \n"
+          "{                                                               \n"
+          "    float delta = (el - offset) * el_max;                       \n"
+          "    float adelta = abs(delta);                                  \n"
+          "    float nonzero = step(0.5, adelta);                          \n"
+          "    float residual = sign(delta) * nonzero *                    \n"
+          "                     ((adelta - 0.5) * slope + threshold);      \n"
+          "    return clamp(residual, -vdr_in_max, vdr_in_max);            \n"
+          "}                                                               \n",
+          inv_nlq);
+
+    ident_t el_luma_pos;
+    ident_t el_luma = sh_bind(sh, el_y.state->plane.texture,
+                              el_y.state->plane.address_mode,
+                              PL_TEX_SAMPLE_NEAREST, "dovi_el_luma",
+                              &el_y.state->img.rect, &el_luma_pos, NULL);
+    ident_t el_chroma = sh_bind(sh, el_cb.state->plane.texture,
+                                el_cb.state->plane.address_mode,
+                                PL_TEX_SAMPLE_NEAREST, "dovi_el_chroma",
+                                &el_cb.state->img.rect, NULL, NULL);
+    if (!el_luma || !el_chroma)
+        return false;
+
+    ident_t el_cr_tex = {0};
+    if (!packed_chroma) {
+        el_cr_tex = sh_bind(sh, el_cr.state->plane.texture,
+                            el_cr.state->plane.address_mode,
+                            PL_TEX_SAMPLE_NEAREST, "dovi_el_cr",
+                            &el_cr.state->img.rect, NULL, NULL);
+        if (!el_cr_tex)
+            return false;
+    }
+
+    sh_describe(sh, "dolbyvision el residual");
+    GLSL("// pl_shader_dovi_prepare_el_residual \n"
+         "#define PL_DOVI_EL_RESIDUAL_DEFINED 1 \n"
+         "vec3 dovi_el_residual = vec3(0.0);    \n");
+    GLSL("{                                     \n");
+
+    struct pl_color_repr el_repr = {
+        .bits = dovi_el_infer_bits(el),
+        .levels = PL_COLOR_LEVELS_FULL,
+    };
+    float el_scale_data[4] = {
+        pl_color_repr_normalize(&el_repr),
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    ident_t el_scale = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec4("dovi_el_scale"),
+        .data = el_scale_data,
+        .dynamic = true,
+    });
+
+    if (el_y.state->plane.flipped) {
+        GLSL("#define DOVI_EL_POS_Y(X, Y) ivec2((X), textureSize("$", 0).y - 1 - (Y)) \n",
+             el_luma);
+    } else {
+        GLSL("#define DOVI_EL_POS_Y(X, Y) ivec2((X), (Y))                             \n");
+    }
+
+    if (el_cb.state->plane.flipped) {
+        GLSL("#define DOVI_EL_POS_CB(X, Y) ivec2((X), textureSize("$", 0).y - 1 - (Y))\n",
+             el_chroma);
+    } else {
+        GLSL("#define DOVI_EL_POS_CB(X, Y) ivec2((X), (Y))                            \n");
+    }
+
+    if (packed_chroma) {
+        GLSL("#define DOVI_EL_POS_CR(X, Y) DOVI_EL_POS_CB((X), (Y))                   \n");
+    } else if (el_cr.state->plane.flipped) {
+        GLSL("#define DOVI_EL_POS_CR(X, Y) ivec2((X), textureSize("$", 0).y - 1 - (Y))\n",
+             el_cr_tex);
+    } else {
+        GLSL("#define DOVI_EL_POS_CR(X, Y) ivec2((X), (Y))                            \n");
+    }
+
+    GLSL("#define DOVI_EL_FETCH_Y(X, Y)                                      \\\n"
+         "    (texelFetch("$",                                               \\\n"
+         "                clamp(DOVI_EL_POS_Y((X), (Y)), ivec2(0),           \\\n"
+         "                      textureSize("$", 0) - ivec2(1)),             \\\n"
+         "                0)[%d] * "$".x)                                      \n",
+         el_luma, el_luma, el_y.sample_order, el_scale);
+    GLSL("#define DOVI_EL_FETCH_CB(X, Y)                                     \\\n"
+         "    (texelFetch("$",                                               \\\n"
+         "                clamp(DOVI_EL_POS_CB((X), (Y)), ivec2(0),          \\\n"
+         "                      textureSize("$", 0) - ivec2(1)),             \\\n"
+         "                0)[%d] * "$".x)                                      \n",
+         el_chroma, el_chroma, el_cb.sample_order, el_scale);
+
+    if (packed_chroma) {
+        GLSL("#define DOVI_EL_FETCH_CR(X, Y)                                 \\\n"
+             "    (texelFetch("$",                                           \\\n"
+             "                clamp(DOVI_EL_POS_CR((X), (Y)), ivec2(0),      \\\n"
+             "                      textureSize("$", 0) - ivec2(1)),         \\\n"
+             "                0)[%d] * "$".x)                                  \n",
+             el_chroma, el_chroma, el_cr.sample_order, el_scale);
+    } else {
+        GLSL("#define DOVI_EL_FETCH_CR(X, Y)                                 \\\n"
+             "    (texelFetch("$",                                           \\\n"
+             "                clamp(DOVI_EL_POS_CR((X), (Y)), ivec2(0),      \\\n"
+             "                      textureSize("$", 0) - ivec2(1)),         \\\n"
+             "                0)[%d] * "$".x)                                  \n",
+             el_cr_tex, el_cr_tex, el_cr.sample_order, el_scale);
+    }
+
+    GLSL("#define DOVI_EL_MAX max("$", 1.0)                                    \n"
+         "#define DOVI_EL_RESIDUAL_Y(EL)                                     \\\n"
+         "    "$"((EL), "$".x, "$".x, "$".x, "$".x, DOVI_EL_MAX)               \n"
+         "#define DOVI_EL_RESIDUAL_CB(EL)                                    \\\n"
+         "    "$"((EL), "$".y, "$".y, "$".y, "$".y, DOVI_EL_MAX)               \n"
+         "#define DOVI_EL_RESIDUAL_CR(EL)                                    \\\n"
+         "    "$"((EL), "$".z, "$".z, "$".z, "$".z, DOVI_EL_MAX)               \n",
+         nlq_el_max,
+         inv_nlq, nlq_offset, nlq_slope, nlq_threshold, nlq_vdr_in_max,
+         inv_nlq, nlq_offset, nlq_slope, nlq_threshold, nlq_vdr_in_max,
+         inv_nlq, nlq_offset, nlq_slope, nlq_threshold, nlq_vdr_in_max);
+
+    if (data->nlq.el_spatial_resampling_filter) {
+        // ETSI GS CCM 001 Annex B.3 Resampling
+
+        float el_y_offset[2] = {
+            el_y.state->img.rect.x0 * 2.0f,
+            dovi_el_rect_y0(el_y.state) * 2.0f,
+        };
+        float el_chroma_offset[2] = {
+            el_cb.state->img.rect.x0 * 2.0f,
+            dovi_el_rect_y0(el_cb.state) * 2.0f,
+        };
+
+        ident_t el_luma_offset = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_vec2("dovi_el_luma_offset"),
+            .data = el_y_offset,
+            .dynamic = true,
+        });
+        ident_t el_chroma_offset_var = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_vec2("dovi_el_chroma_offset"),
+            .data = el_chroma_offset,
+            .dynamic = true,
+        });
+
+        GLSL(
+             "#define DOVI_EL_QUANTIZE(X)                                                      \\\n"
+             "    clamp(floor((X) * DOVI_EL_MAX + 0.5) / DOVI_EL_MAX, 0.0, 1.0)                  \n"
+             "#define DOVI_EL_VERT_Y(X, Y)                                                     \\\n"
+             "    ((((Y) & 1) == 0)                                                            \\\n"
+             "         ? DOVI_EL_QUANTIZE((  -3.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 - 2)          \\\n"
+             "                             + 29.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 - 1)          \\\n"
+             "                            + 111.0 * DOVI_EL_FETCH_Y((X), (Y) / 2)              \\\n"
+             "                              - 9.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 + 1)) / 128.0)\\\n"
+             "         : DOVI_EL_QUANTIZE((  -9.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 - 1)          \\\n"
+             "                            + 111.0 * DOVI_EL_FETCH_Y((X), (Y) / 2)              \\\n"
+             "                             + 29.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 + 1)          \\\n"
+             "                              - 3.0 * DOVI_EL_FETCH_Y((X), (Y) / 2 + 2)) / 128.0)) \n"
+             "#define DOVI_EL_SAMPLE_Y(DST)                                                    \\\n"
+             "    ((((DST).x & 1) == 0)                                                        \\\n"
+             "         ? DOVI_EL_VERT_Y((DST).x / 2, (DST).y)                                  \\\n"
+             "         : DOVI_EL_QUANTIZE((   22.0 * DOVI_EL_VERT_Y((DST).x / 2 - 3, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_Y((DST).x / 2 - 2, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_Y((DST).x / 2 - 1, (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_Y((DST).x / 2,     (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_Y((DST).x / 2 + 1, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_Y((DST).x / 2 + 2, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_Y((DST).x / 2 + 3, (DST).y)  \\\n"
+             "                              + 22.0 * DOVI_EL_VERT_Y((DST).x / 2 + 4, (DST).y)) \\\n"
+             "                             / 4096.0))                                            \n");
+
+        GLSL(
+             "#define DOVI_EL_VERT_CB(X, Y)                                                     \\\n"
+             "    ((((Y) & 1) == 0)                                                             \\\n"
+             "         ? DOVI_EL_QUANTIZE((   64.0 * DOVI_EL_FETCH_CB((X), (Y) / 2 - 1)         \\\n"
+             "                             + 192.0 * DOVI_EL_FETCH_CB((X), (Y) / 2)) / 256.0)   \\\n"
+             "         : DOVI_EL_QUANTIZE((  192.0 * DOVI_EL_FETCH_CB((X), (Y) / 2)             \\\n"
+             "                              + 64.0 * DOVI_EL_FETCH_CB((X), (Y) / 2 + 1)) / 256.0))\n"
+             "#define DOVI_EL_VERT_CR(X, Y)                                                     \\\n"
+             "    ((((Y) & 1) == 0)                                                             \\\n"
+             "         ? DOVI_EL_QUANTIZE((   64.0 * DOVI_EL_FETCH_CR((X), (Y) / 2 - 1)         \\\n"
+             "                             + 192.0 * DOVI_EL_FETCH_CR((X), (Y) / 2)) / 256.0)   \\\n"
+             "         : DOVI_EL_QUANTIZE((  192.0 * DOVI_EL_FETCH_CR((X), (Y) / 2)             \\\n"
+             "                              + 64.0 * DOVI_EL_FETCH_CR((X), (Y) / 2 + 1)) / 256.0))\n"
+             "#define DOVI_EL_SAMPLE_CB_TEXEL(DST)                                              \\\n"
+             "    ((((DST).x & 1) == 0)                                                         \\\n"
+             "         ? DOVI_EL_VERT_CB((DST).x / 2, (DST).y)                                  \\\n"
+             "         : DOVI_EL_QUANTIZE((   22.0 * DOVI_EL_VERT_CB((DST).x / 2 - 3, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_CB((DST).x / 2 - 2, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_CB((DST).x / 2 - 1, (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_CB((DST).x / 2,     (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_CB((DST).x / 2 + 1, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_CB((DST).x / 2 + 2, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_CB((DST).x / 2 + 3, (DST).y)  \\\n"
+             "                              + 22.0 * DOVI_EL_VERT_CB((DST).x / 2 + 4, (DST).y)) \\\n"
+             "                             / 4096.0))                                             \n"
+             "#define DOVI_EL_SAMPLE_CR_TEXEL(DST)                                              \\\n"
+             "    ((((DST).x & 1) == 0)                                                         \\\n"
+             "         ? DOVI_EL_VERT_CR((DST).x / 2, (DST).y)                                  \\\n"
+             "         : DOVI_EL_QUANTIZE((   22.0 * DOVI_EL_VERT_CR((DST).x / 2 - 3, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_CR((DST).x / 2 - 2, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_CR((DST).x / 2 - 1, (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_CR((DST).x / 2,     (DST).y)  \\\n"
+             "                            + 2456.0 * DOVI_EL_VERT_CR((DST).x / 2 + 1, (DST).y)  \\\n"
+             "                             - 524.0 * DOVI_EL_VERT_CR((DST).x / 2 + 2, (DST).y)  \\\n"
+             "                              + 94.0 * DOVI_EL_VERT_CR((DST).x / 2 + 3, (DST).y)  \\\n"
+             "                              + 22.0 * DOVI_EL_VERT_CR((DST).x / 2 + 4, (DST).y)) \\\n"
+             "                             / 4096.0))                                             \n"
+             "#define DOVI_EL_SAMPLE_CB_RES(DST)                                                \\\n"
+             "    DOVI_EL_RESIDUAL_CB(DOVI_EL_SAMPLE_CB_TEXEL(DST))                               \n"
+             "#define DOVI_EL_SAMPLE_CR_RES(DST)                                                \\\n"
+             "    DOVI_EL_RESIDUAL_CR(DOVI_EL_SAMPLE_CR_TEXEL(DST))                               \n");
+
+        GLSL("vec2 dovi_el_uv = gl_FragCoord.xy / vec2("$", "$");                  \n"
+             "ivec2 dovi_el_luma_pos = ivec2(floor(gl_FragCoord.xy + "$"));        \n"
+             "vec2 dovi_el_chroma_virtual_size = vec2("$", "$");                   \n"
+             "vec2 dovi_el_chroma_pos = dovi_el_uv * dovi_el_chroma_virtual_size + \n"
+             "                          "$" - vec2(0.5);                           \n"
+             "dovi_el_chroma_pos = clamp(dovi_el_chroma_pos, vec2(0.0),            \n"
+             "                           dovi_el_chroma_virtual_size - vec2(1.0)); \n"
+             "ivec2 dovi_el_chroma_base = ivec2(floor(dovi_el_chroma_pos));        \n"
+             "vec2 dovi_el_chroma_frac = fract(dovi_el_chroma_pos);                \n"
+             "float el_y = DOVI_EL_SAMPLE_Y(dovi_el_luma_pos);                     \n"
+             "float el_y_res = DOVI_EL_RESIDUAL_Y(el_y);                           \n"
+             "float el_cb_res = mix(                                               \n"
+             "    mix(DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base),                  \n"
+             "        DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(1, 0)),    \n"
+             "        dovi_el_chroma_frac.x),                                      \n"
+             "    mix(DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(0, 1)),    \n"
+             "        DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(1, 1)),    \n"
+             "        dovi_el_chroma_frac.x),                                      \n"
+             "    dovi_el_chroma_frac.y);                                          \n"
+             "float el_cr_res = mix(                                               \n"
+             "    mix(DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base),                  \n"
+             "        DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(1, 0)),    \n"
+             "        dovi_el_chroma_frac.x),                                      \n"
+             "    mix(DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(0, 1)),    \n"
+             "        DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(1, 1)),    \n"
+             "        dovi_el_chroma_frac.x),                                      \n"
+             "    dovi_el_chroma_frac.y);                                          \n",
+             SH_FLOAT(target_width), SH_FLOAT(target_height),
+             el_luma_offset,
+             SH_FLOAT(el_c_w * 2.0f), SH_FLOAT(el_c_h * 2.0f),
+             el_chroma_offset_var);
+        GLSL("#undef DOVI_EL_QUANTIZE                                         \n"
+             "#undef DOVI_EL_VERT_Y                                           \n"
+             "#undef DOVI_EL_VERT_CB                                          \n"
+             "#undef DOVI_EL_VERT_CR                                          \n"
+             "#undef DOVI_EL_SAMPLE_Y                                         \n"
+             "#undef DOVI_EL_SAMPLE_CB_TEXEL                                  \n"
+             "#undef DOVI_EL_SAMPLE_CR_TEXEL                                  \n");
+    } else {
+        // 1:1, no EL upsample
+        float el_chroma_offset[2] = {
+            el_cb.state->img.rect.x0,
+            dovi_el_rect_y0(el_cb.state),
+        };
+        ident_t el_chroma_offset_var = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_vec2("dovi_el_chroma_offset"),
+            .data = el_chroma_offset,
+            .dynamic = true,
+        });
+
+        GLSL("vec4 el_luma_sample = textureLod("$", "$", 0.0);              \n",
+             el_luma, el_luma_pos);
+        GLSL("float el_y = el_luma_sample[%d] * "$".x;                      \n"
+             "float el_y_res = DOVI_EL_RESIDUAL_Y(el_y);                    \n",
+             el_y.sample_order, el_scale);
+
+        GLSL("vec2 dovi_el_uv = gl_FragCoord.xy / vec2("$", "$");           \n"
+             "vec2 dovi_el_chroma_size = vec2("$", "$");                    \n"
+             "vec2 dovi_el_chroma_pos = dovi_el_uv * dovi_el_chroma_size+   \n"
+             "                          "$" - vec2(0.5);                    \n"
+             "dovi_el_chroma_pos = clamp(dovi_el_chroma_pos, vec2(0.0),     \n"
+             "                            dovi_el_chroma_size - vec2(1.0)); \n"
+             "ivec2 dovi_el_chroma_base = ivec2(floor(dovi_el_chroma_pos)); \n"
+             "vec2 dovi_el_chroma_frac = fract(dovi_el_chroma_pos);         \n",
+             SH_FLOAT(target_width), SH_FLOAT(target_height),
+             SH_FLOAT(el_c_w), SH_FLOAT(el_c_h),
+             el_chroma_offset_var);
+
+        if (packed_chroma) {
+            GLSL("#define DOVI_EL_FETCH_CHROMA(DST)                                         \\\n"
+                 "    (texelFetch("$",                                                      \\\n"
+                 "                clamp(DOVI_EL_POS_CB((DST).x, (DST).y), ivec2(0),         \\\n"
+                 "                      textureSize("$", 0) - ivec2(1)),                    \\\n"
+                 "                0) * "$".x)                                                 \n"
+                 "#define DOVI_EL_CHROMA_RES(S)                                             \\\n"
+                 "    vec2(DOVI_EL_RESIDUAL_CB((S)[%d]), DOVI_EL_RESIDUAL_CR((S)[%d]))        \n"
+                 "vec4 el_chroma_00 = DOVI_EL_FETCH_CHROMA(dovi_el_chroma_base);              \n"
+                 "vec4 el_chroma_10 = DOVI_EL_FETCH_CHROMA(dovi_el_chroma_base + ivec2(1, 0));\n"
+                 "vec4 el_chroma_01 = DOVI_EL_FETCH_CHROMA(dovi_el_chroma_base + ivec2(0, 1));\n"
+                 "vec4 el_chroma_11 = DOVI_EL_FETCH_CHROMA(dovi_el_chroma_base + ivec2(1, 1));\n"
+                 "vec2 el_chroma_res = mix(                                                   \n"
+                 "    mix(DOVI_EL_CHROMA_RES(el_chroma_00),                                   \n"
+                 "        DOVI_EL_CHROMA_RES(el_chroma_10),                                   \n"
+                 "        dovi_el_chroma_frac.x),                                             \n"
+                 "    mix(DOVI_EL_CHROMA_RES(el_chroma_01),                                   \n"
+                 "        DOVI_EL_CHROMA_RES(el_chroma_11),                                   \n"
+                 "        dovi_el_chroma_frac.x),                                             \n"
+                 "    dovi_el_chroma_frac.y);                                                 \n"
+                 "float el_cb_res = el_chroma_res.x;                                          \n"
+                 "float el_cr_res = el_chroma_res.y;                                          \n"
+                 "#undef DOVI_EL_FETCH_CHROMA                                                 \n"
+                 "#undef DOVI_EL_CHROMA_RES                                                   \n",
+                 el_chroma, el_chroma, el_scale, el_cb.sample_order, el_cr.sample_order);
+        } else {
+            GLSL("#define DOVI_EL_SAMPLE_CB_RES(DST)                                 \\\n"
+                 "    DOVI_EL_RESIDUAL_CB(DOVI_EL_FETCH_CB((DST).x, (DST).y))          \n"
+                 "#define DOVI_EL_SAMPLE_CR_RES(DST)                                 \\\n"
+                 "    DOVI_EL_RESIDUAL_CR(DOVI_EL_FETCH_CR((DST).x, (DST).y))          \n"
+                 "float el_cb_res = mix(                                               \n"
+                 "    mix(DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base),                  \n"
+                 "        DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(1, 0)),    \n"
+                 "        dovi_el_chroma_frac.x),                                      \n"
+                 "    mix(DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(0, 1)),    \n"
+                 "        DOVI_EL_SAMPLE_CB_RES(dovi_el_chroma_base + ivec2(1, 1)),    \n"
+                 "        dovi_el_chroma_frac.x),                                      \n"
+                 "    dovi_el_chroma_frac.y);                                          \n"
+                 "float el_cr_res = mix(                                               \n"
+                 "    mix(DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base),                  \n"
+                 "        DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(1, 0)),    \n"
+                 "        dovi_el_chroma_frac.x),                                      \n"
+                 "    mix(DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(0, 1)),    \n"
+                 "        DOVI_EL_SAMPLE_CR_RES(dovi_el_chroma_base + ivec2(1, 1)),    \n"
+                 "        dovi_el_chroma_frac.x),                                      \n"
+                 "    dovi_el_chroma_frac.y);                                          \n");
+        }
+    }
+
+    GLSL("dovi_el_residual = vec3(el_y_res, el_cb_res, el_cr_res);      \n"
+         "}                                                             \n"
+         "#undef DOVI_EL_POS_Y                                          \n"
+         "#undef DOVI_EL_POS_CB                                         \n"
+         "#undef DOVI_EL_POS_CR                                         \n"
+         "#undef DOVI_EL_FETCH_Y                                        \n"
+         "#undef DOVI_EL_FETCH_CB                                       \n"
+         "#undef DOVI_EL_FETCH_CR                                       \n"
+         "#undef DOVI_EL_MAX                                            \n"
+         "#undef DOVI_EL_RESIDUAL_Y                                     \n"
+         "#undef DOVI_EL_RESIDUAL_CB                                    \n"
+         "#undef DOVI_EL_RESIDUAL_CR                                    \n"
+         "#undef DOVI_EL_SAMPLE_CB_RES                                  \n"
+         "#undef DOVI_EL_SAMPLE_CR_RES                                  \n");
+    return true;
+#else
+    SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
+    return false;
+#endif
 }
 
 // Returns true if debanding was applied
@@ -1556,34 +2224,11 @@ static bool pass_read_image(struct pass_state *pass)
     struct plane_state planes[4];
     struct plane_state *ref = &planes[pass->src_ref];
     pl_assert(pass->src_ref >= 0 && pass->src_ref < image->num_planes);
+    init_frame_plane_states(image, planes);
 
     for (int i = 0; i < image->num_planes; i++) {
-        planes[i] = (struct plane_state) {
-            .type = detect_plane_type(&image->planes[i], &image->repr),
-            .plane = image->planes[i],
-            .img = {
-                .w = image->planes[i].texture->params.w,
-                .h = image->planes[i].texture->params.h,
-                .tex = image->planes[i].texture,
-                .repr = image->repr,
-                .color = image->color,
-                .comps = image->planes[i].components,
-            },
-            .fmt = image->planes[i].texture->params.format,
-        };
-
-        // Explicitly skip alpha channel when overridden
-        if (image->repr.alpha == PL_ALPHA_NONE) {
-            if (planes[i].type == PLANE_ALPHA) {
-                planes[i].type = PLANE_INVALID;
-                continue;
-            } else {
-                for (int j = 0; j < planes[i].plane.components; j++) {
-                    if (planes[i].plane.component_mapping[j] == PL_CHANNEL_A)
-                        planes[i].plane.component_mapping[j] = PL_CHANNEL_NONE;
-                }
-            }
-        }
+        if (!planes[i].type)
+            continue;
 
         // Deinterlace plane if needed
         if (image->field != PL_FIELD_NONE && params->deinterlace_params &&
@@ -1723,27 +2368,7 @@ static bool pass_read_image(struct pass_state *pass)
         if (!st->type)
             continue;
 
-        float rx = (float) st->plane.texture->params.w / ref_tex->params.w,
-              ry = (float) st->plane.texture->params.h / ref_tex->params.h;
-
-        // Only accept integer scaling ratios. This accounts for the fact that
-        // fractionally subsampled planes get rounded up to the nearest integer
-        // size, which we want to discard.
-        float rrx = rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx),
-              rry = ry >= 1 ? roundf(ry) : 1.0 / roundf(1.0 / ry);
-
-        float sx = st->plane.shift_x,
-              sy = st->plane.shift_y;
-
-        st->img.rect = (pl_rect2df) {
-            .x0 = (image->crop.x0 - sx) * rrx,
-            .y0 = (image->crop.y0 - sy) * rry,
-            .x1 = (image->crop.x1 - sx) * rrx,
-            .y1 = (image->crop.y1 - sy) * rry,
-        };
-
-        st->plane_w = ref_tex->params.w * rrx;
-        st->plane_h = ref_tex->params.h * rry;
+        set_plane_state_rect(image, ref_tex, st);
 
         PL_TRACE(rr, "Plane %d:", i);
         log_plane_info(rr, st);
@@ -1936,7 +2561,20 @@ static bool pass_read_image(struct pass_state *pass)
             pl_shader_linearize(sh, &pass->img.color);
             pass->img.color.transfer = PL_COLOR_TRC_LINEAR;
         }
-        pl_shader_decode_color(sh, &pass->img.repr, params->color_adjustment);
+
+        if (pass->img.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+            pass->img.repr.dovi &&
+            pass->img.repr.dovi->nlq.residual_enabled &&
+            image->enhancement_layer)
+        {
+            if (!pl_shader_dovi_prepare_el_residual(sh, image, pass->img.repr.dovi,
+                                                    pass->img.w, pass->img.h) &&
+                pl_shader_is_failed(sh))
+                return false;
+            pl_shader_decode_color(sh, &pass->img.repr, params->color_adjustment);
+        } else {
+            pl_shader_decode_color(sh, &pass->img.repr, params->color_adjustment);
+        }
     }
 
     if (lut_type == PL_LUT_NORMALIZED)
@@ -2481,8 +3119,6 @@ static uint8_t plane_comps(const struct pl_plane *plane,
     return comps;
 }
 
-static int frame_ref(const struct pl_frame *frame);
-
 static void clear_target(struct pass_state *pass, const pl_tex background,
                          float bg_scale, const struct pl_render_params *params)
 {
@@ -3025,6 +3661,9 @@ static bool validate_structs(pl_renderer rr,
     for (int i = 0; i < image->num_overlays; i++)
         validate_overlay(image->overlays[i]);
 
+    if (image->enhancement_layer)
+        require(dovi_el_validate_frame(image->enhancement_layer));
+
     if (image->field != PL_FIELD_NONE) {
         require(image->first_field != PL_FIELD_NONE);
         if (image->prev)
@@ -3222,6 +3861,7 @@ static void pass_uninit(struct pass_state *pass)
     pl_dispatch_abort(rr->dp, &pass->img.sh);
     release_frame(pass, &pass->next, &pass->acquired.next);
     release_frame(pass, &pass->prev, &pass->acquired.prev);
+    release_frame(pass, &pass->dovi_el, &pass->acquired.dovi_el);
     release_frame(pass, &pass->image, &pass->acquired.image);
     release_frame(pass, &pass->target, &pass->acquired.target);
     pl_free_ptr(&pass->tmp);
@@ -3319,6 +3959,13 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
     if (acquire_image && image) {
         if (!acquire_frame(pass, image, &pass->acquired.image))
             goto error;
+
+        if (image->enhancement_layer) {
+            pass->dovi_el = *image->enhancement_layer;
+            image->enhancement_layer = &pass->dovi_el;
+            if (!acquire_frame(pass, &pass->dovi_el, &pass->acquired.dovi_el))
+                goto error;
+        }
 
         const struct pl_render_params *params = pass->params;
         const struct pl_deinterlace_params *deint = params->deinterlace_params;
@@ -3646,6 +4293,10 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
     // on high-contrast transitions
     struct pl_color_space mix_csp = target->color;
     mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+    if (refimg->repr.dovi && pl_color_space_is_hdr(&target->color)) {
+        PL_TRACE(rr, "Dolby Vision HDR frame mixing: using target transfer");
+        mix_csp.transfer = target->color.transfer;
+    }
 
     int fidx = 0;
     struct cached_frame frames[MAX_MIX_FRAMES];
@@ -3845,7 +4496,7 @@ retry:
             pass_convert_colors(&inter_pass);
 
             pl_assert(inter_pass.img.sh); // guaranteed by `pass_convert_colors`
-            pl_assert(inter_pass.img.color.transfer == PL_COLOR_TRC_LINEAR);
+            pl_assert(inter_pass.img.color.transfer == mix_csp.transfer);
 
             pl_shader_set_alpha(inter_pass.img.sh, &inter_pass.img.repr,
                                 PL_ALPHA_PREMULTIPLIED); // for frame mixing
