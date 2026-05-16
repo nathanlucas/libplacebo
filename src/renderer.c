@@ -1549,6 +1549,66 @@ static bool want_merge(struct pass_state *pass,
     return false;
 }
 
+#ifdef PL_HAVE_DOVI
+// Build a sub-shader that samples the enhancement layer planes and returns
+// the (color-repr-normalized) EL signal.
+static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+{
+    pl_renderer rr = pass->rr;
+    pl_shader sh = pl_dispatch_begin_ex(rr->dp, true);
+    if (!sh_require(sh, PL_SHADER_SIG_NONE, 0, 0))
+        return NULL;
+
+#pragma GLSL vec4 color = vec4(0.0), tmp;
+
+    for (int i = 0; i < el->num_planes; i++) {
+        const struct pl_plane *plane = &el->planes[i];
+        if (!plane->texture)
+            continue;
+
+        struct pl_color_repr el_repr = el->repr;
+        float el_scale = pl_color_repr_normalize(&el_repr);
+
+        struct pl_sample_src src = {
+            .tex          = plane->texture,
+            .components   = plane->components,
+            .address_mode = plane->address_mode,
+            .new_w        = pass->img.w,
+            .new_h        = pass->img.h,
+            .rect = {
+                0, 0,
+                plane->texture->params.w,
+                plane->texture->params.h,
+            },
+        };
+
+        pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
+        if (!pl_shader_sample_direct(plane_sh, &src)) {
+            pl_dispatch_abort(rr->dp, &plane_sh);
+            return NULL;
+        }
+
+        ident_t sub = sh_subpass(sh, plane_sh);
+        pl_dispatch_abort(rr->dp, &plane_sh);
+        if (!sub) {
+            pl_dispatch_abort(rr->dp, &sh);
+            return NULL;
+        }
+
+#pragma GLSL tmp = vec4(${float: el_scale}) * $sub();
+        for (int c = 0; c < src.components; c++) {
+            int idx = plane->component_mapping[c];
+            if (idx < 0 || idx > 2)
+                continue;
+#pragma GLSL color[${const int: idx}] = tmp[${const int: c}];
+        }
+    }
+
+    sh_describe(sh, "enhancement layer");
+    return sh;
+}
+#endif // PL_HAVE_DOVI
+
 // This scales and merges all of the source images, and initializes pass->img.
 static bool pass_read_image(struct pass_state *pass)
 {
@@ -1939,10 +1999,28 @@ static bool pass_read_image(struct pass_state *pass)
             pl_shader_linearize(sh, &pass->img.color);
             pass->img.color.transfer = PL_COLOR_TRC_LINEAR;
         }
+
+        pl_shader el_sh = NULL;
+#ifdef PL_HAVE_DOVI
+        bool compose_el = image->enhancement_layer &&
+                          pass->img.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                          pass->img.repr.dovi &&
+                          pass->img.repr.dovi->nlq_active;
+        if (compose_el) {
+            el_sh = sample_el(pass, image->enhancement_layer);
+            if (!el_sh) {
+                PL_ERR(rr, "Failed sampling enhancement layer; "
+                           "falling back to base-layer-only rendering");
+                rr->errors |= PL_RENDER_ERR_SAMPLING;
+            }
+        }
+#endif
         pl_shader_decode_color_ex(sh, pl_color_decode_args(
-            .repr             = &pass->img.repr,
-            .color_adjustment = params->color_adjustment,
+            .repr              = &pass->img.repr,
+            .color_adjustment  = params->color_adjustment,
+            .enhancement_layer = el_sh,
         ));
+        pl_dispatch_abort(rr->dp, &el_sh);
     }
 
     if (lut_type == PL_LUT_NORMALIZED)
@@ -3347,6 +3425,10 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
         }
         if (image->enhancement_layer) {
             bool acquire_el = false;
+#ifdef PL_HAVE_DOVI
+            acquire_el = image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                         image->repr.dovi && image->repr.dovi->nlq_active;
+#endif
             if (acquire_el) {
                 pass->enhancement_layer = *image->enhancement_layer;
                 image->enhancement_layer = &pass->enhancement_layer;
