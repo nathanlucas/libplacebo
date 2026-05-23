@@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     {
+      '369': 'deprecate pl_avdovi_metadata_supported and pl_avframe_params.map_dovi_force',
       '368': 'add pl_color_decode_args.enhancement_layer',
       '367': 'add pl_shader_decode_color_ex and pl_color_decode_args, deprecate pl_shader_decode_color',
       '366': 'add pl_frame.enhancement_layer',
