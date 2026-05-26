@@ -1553,6 +1553,24 @@ static bool want_merge(struct pass_state *pass,
 }
 
 #ifdef PL_HAVE_DOVI
+static pl_tex dovi_el_ref_tex(const struct pl_frame *el)
+{
+    for (int i = 0; i < el->num_planes; i++) {
+        switch (detect_plane_type(&el->planes[i], &el->repr)) {
+        case PLANE_RGB:
+        case PLANE_LUMA:
+        case PLANE_XYZ:
+            return el->planes[i].texture;
+        case PLANE_CHROMA:
+        case PLANE_ALPHA:
+        case PLANE_INVALID:
+            break;
+        }
+    }
+
+    return el->num_planes ? el->planes[0].texture : NULL;
+}
+
 // Build a sub-shader that samples the enhancement layer planes and returns
 // the (color-repr-normalized) EL signal.
 static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
@@ -1564,6 +1582,23 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 
 #pragma GLSL vec4 color = vec4(0.0), tmp;
 
+    const struct pl_frame *image = &pass->image;
+    pl_tex image_ref = image->planes[pass->src_ref].texture;
+    pl_tex el_ref = dovi_el_ref_tex(el);
+    if (!image_ref || !el_ref) {
+        pl_dispatch_abort(rr->dp, &sh);
+        return NULL;
+    }
+
+    float scale_x = (float) el_ref->params.w / (float) image_ref->params.w;
+    float scale_y = (float) el_ref->params.h / (float) image_ref->params.h;
+    pl_rect2df el_crop = {
+        .x0 = image->crop.x0 * scale_x,
+        .y0 = image->crop.y0 * scale_y,
+        .x1 = image->crop.x1 * scale_x,
+        .y1 = image->crop.y1 * scale_y,
+    };
+
     for (int i = 0; i < el->num_planes; i++) {
         const struct pl_plane *plane = &el->planes[i];
         if (!plane->texture)
@@ -1571,6 +1606,23 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 
         struct pl_color_repr el_repr = el->repr;
         float el_scale = pl_color_repr_normalize(&el_repr);
+        float rx = (float) plane->texture->params.w / el_ref->params.w,
+              ry = (float) plane->texture->params.h / el_ref->params.h;
+        float rrx = rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx),
+              rry = ry >= 1 ? roundf(ry) : 1.0 / roundf(1.0 / ry);
+
+        pl_rect2df rect = {
+            .x0 = (el_crop.x0 - plane->shift_x) * rrx,
+            .y0 = (el_crop.y0 - plane->shift_y) * rry,
+            .x1 = (el_crop.x1 - plane->shift_x) * rrx,
+            .y1 = (el_crop.y1 - plane->shift_y) * rry,
+        };
+
+        if (plane->flipped) {
+            float plane_h = el_ref->params.h * rry;
+            rect.y0 = plane_h - rect.y0;
+            rect.y1 = plane_h - rect.y1;
+        }
 
         struct pl_sample_src src = {
             .tex          = plane->texture,
@@ -1578,11 +1630,7 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
             .address_mode = plane->address_mode,
             .new_w        = pass->img.w,
             .new_h        = pass->img.h,
-            .rect = {
-                0, 0,
-                plane->texture->params.w,
-                plane->texture->params.h,
-            },
+            .rect         = rect,
         };
 
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
